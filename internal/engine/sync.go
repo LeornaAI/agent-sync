@@ -211,7 +211,7 @@ func (e *SyncEngine) fetchSourceFiles(ctx context.Context, ls lock.LockedSource,
 			resolved.Files[fp] = hash.SHA256
 		}
 
-		fetched, fetchErr := resolver.Fetch(ctx, resolved)
+		fetched, fetchErr := fetchResolvedSource(ctx, resolver, resolved, e.ProjectRoot)
 		if fetchErr != nil {
 			return nil, fetchErr
 		}

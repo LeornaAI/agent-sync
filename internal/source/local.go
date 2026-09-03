@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/bianoble/agent-sync/internal/config"
@@ -24,23 +25,15 @@ func (l *LocalResolver) Resolve(ctx context.Context, src config.Source, projectR
 	absPath = filepath.Clean(absPath)
 
 	// Validate the path is within the project root.
-	realRoot, err := filepath.Abs(projectRoot)
+	realPath, err := confinedLocalPath(projectRoot, absPath)
 	if err != nil {
-		return nil, &SourceError{Source: src.Name, Operation: "resolve", Err: fmt.Errorf("resolving project root: %w", err)}
-	}
-	realPath, err := filepath.Abs(absPath)
-	if err != nil {
-		return nil, &SourceError{Source: src.Name, Operation: "resolve", Err: fmt.Errorf("resolving path: %w", err)}
-	}
-
-	rootPrefix := realRoot + string(filepath.Separator)
-	if realPath != realRoot && !strings.HasPrefix(realPath, rootPrefix) {
 		return nil, &SourceError{
 			Source:    src.Name,
 			Operation: "resolve",
-			Err:       fmt.Errorf("path '%s' resolves outside project root", src.Path),
+			Err:       fmt.Errorf("path '%s': %w", src.Path, err),
 		}
 	}
+	absPath = realPath
 
 	info, err := os.Stat(absPath)
 	if err != nil {
@@ -74,11 +67,15 @@ func (l *LocalResolver) Resolve(ctx context.Context, src config.Source, projectR
 				return nil
 			}
 
+			confinedPath, confineErr := confinedLocalPath(projectRoot, path)
+			if confineErr != nil {
+				return confineErr
+			}
 			rel, relErr := filepath.Rel(absPath, path)
 			if relErr != nil {
 				return relErr
 			}
-			hash, hashErr := hashLocalFile(path)
+			hash, hashErr := hashLocalFile(confinedPath)
 			if hashErr != nil {
 				return hashErr
 			}
@@ -119,8 +116,10 @@ func (l *LocalResolver) Fetch(ctx context.Context, resolved *ResolvedSource) ([]
 	// we use the Path as-is since it was resolved during Resolve().
 	// The engine layer will handle the project root prefix.
 
+	relPaths := sortedLocalPaths(resolved.Files)
 	var fetched []FetchedFile
-	for relPath, expectedHash := range resolved.Files {
+	for _, relPath := range relPaths {
+		expectedHash := resolved.Files[relPath]
 		// During fetch, the engine prepends the project root.
 		// Here we return the expected structure.
 		fetched = append(fetched, FetchedFile{
@@ -134,18 +133,32 @@ func (l *LocalResolver) Fetch(ctx context.Context, resolved *ResolvedSource) ([]
 
 // FetchWithRoot fetches local files with the project root for path resolution.
 func (l *LocalResolver) FetchWithRoot(ctx context.Context, resolved *ResolvedSource, projectRoot string) ([]FetchedFile, error) {
-	basePath := filepath.Join(projectRoot, resolved.Path)
+	if resolved == nil || resolved.Path == "" {
+		return nil, &SourceError{Source: resolvedName(resolved), Operation: "fetch", Err: fmt.Errorf("resolved source missing path")}
+	}
+	basePath, err := confinedLocalPath(projectRoot, filepath.Join(projectRoot, resolved.Path))
+	if err != nil {
+		return nil, &SourceError{Source: resolved.Name, Operation: "fetch", Err: err}
+	}
 
 	info, err := os.Stat(basePath)
 	if err != nil {
 		return nil, &SourceError{Source: resolved.Name, Operation: "fetch", Err: fmt.Errorf("stat %s: %w", resolved.Path, err)}
 	}
 
+	relPaths := sortedLocalPaths(resolved.Files)
 	var fetched []FetchedFile
-	for relPath, expectedHash := range resolved.Files {
+	for _, relPath := range relPaths {
+		expectedHash := resolved.Files[relPath]
+		if err := ctx.Err(); err != nil {
+			return nil, &SourceError{Source: resolved.Name, Operation: "fetch", Err: err}
+		}
 		var absPath string
 		if info.IsDir() {
-			absPath = filepath.Join(basePath, relPath)
+			absPath, err = confinedLocalPath(projectRoot, filepath.Join(basePath, relPath))
+			if err != nil {
+				return nil, &SourceError{Source: resolved.Name, Operation: "fetch", Err: err}
+			}
 		} else {
 			absPath = basePath
 		}
@@ -173,6 +186,46 @@ func (l *LocalResolver) FetchWithRoot(ctx context.Context, resolved *ResolvedSou
 	}
 
 	return fetched, nil
+}
+
+func sortedLocalPaths(files map[string]string) []string {
+	paths := make([]string, 0, len(files))
+	for path := range files {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	return paths
+}
+
+func confinedLocalPath(projectRoot, candidate string) (string, error) {
+	realRoot, err := filepath.Abs(projectRoot)
+	if err != nil {
+		return "", fmt.Errorf("resolving project root: %w", err)
+	}
+	realRoot, err = filepath.EvalSymlinks(realRoot)
+	if err != nil {
+		return "", fmt.Errorf("resolving project root symlinks: %w", err)
+	}
+	realPath, err := filepath.Abs(candidate)
+	if err != nil {
+		return "", fmt.Errorf("resolving path: %w", err)
+	}
+	realPath, err = filepath.EvalSymlinks(realPath)
+	if err != nil {
+		return "", fmt.Errorf("resolving path symlinks: %w", err)
+	}
+	rootPrefix := realRoot + string(filepath.Separator)
+	if realPath != realRoot && !strings.HasPrefix(realPath, rootPrefix) {
+		return "", fmt.Errorf("path resolves outside project root")
+	}
+	return realPath, nil
+}
+
+func resolvedName(resolved *ResolvedSource) string {
+	if resolved == nil {
+		return "local"
+	}
+	return resolved.Name
 }
 
 func hashLocalFile(path string) (string, error) {

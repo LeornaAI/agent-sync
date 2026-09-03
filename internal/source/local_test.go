@@ -119,6 +119,66 @@ func TestLocalResolverRejectsEscapePath(t *testing.T) {
 	}
 }
 
+func TestLocalFetchWithRootRejectsSymlinkEscape(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	content := []byte("outside")
+	outsideFile := filepath.Join(outside, "secret.md")
+	if err := os.WriteFile(outsideFile, content, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsideFile, filepath.Join(root, "linked.md")); err != nil {
+		t.Fatal(err)
+	}
+	resolved := &ResolvedSource{
+		Name: "escape", Type: "local", Path: "linked.md",
+		Files: map[string]string{"linked.md": computeLocalHash(content)},
+	}
+
+	_, err := (&LocalResolver{}).FetchWithRoot(context.Background(), resolved, root)
+	if err == nil || !strings.Contains(err.Error(), "outside project root") {
+		t.Fatalf("FetchWithRoot() error = %v, want path confinement error", err)
+	}
+}
+
+func TestLocalResolveRejectsNestedSymlinkEscape(t *testing.T) {
+	root := t.TempDir()
+	sourceDir := filepath.Join(root, "source")
+	if err := os.MkdirAll(sourceDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	outsideFile := filepath.Join(t.TempDir(), "secret.md")
+	if err := os.WriteFile(outsideFile, []byte("outside"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsideFile, filepath.Join(sourceDir, "linked.md")); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := (&LocalResolver{}).Resolve(context.Background(), config.Source{
+		Name: "escape", Type: "local", Path: "source",
+	}, root)
+	if err == nil || !strings.Contains(err.Error(), "outside project root") {
+		t.Fatalf("Resolve() error = %v, want path confinement error", err)
+	}
+}
+
+func TestLocalFetchOrderIsDeterministic(t *testing.T) {
+	resolved := &ResolvedSource{
+		Name: "ordered", Type: "local", Path: "source",
+		Files: map[string]string{"z.md": "z", "a.md": "a", "m.md": "m"},
+	}
+	fetched, err := (&LocalResolver{}).Fetch(context.Background(), resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index, want := range []string{"a.md", "m.md", "z.md"} {
+		if fetched[index].RelPath != want {
+			t.Fatalf("fetched[%d].RelPath = %q, want %q", index, fetched[index].RelPath, want)
+		}
+	}
+}
+
 func TestLocalResolverSkipsHiddenFiles(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "src")

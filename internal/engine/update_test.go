@@ -1,15 +1,101 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/bianoble/agent-sync/internal/cache"
 	"github.com/bianoble/agent-sync/internal/config"
 	"github.com/bianoble/agent-sync/internal/lock"
 	"github.com/bianoble/agent-sync/internal/source"
+	"github.com/bianoble/agent-sync/internal/target"
 )
+
+func TestLocalSourceUpdateAndSyncPreserveContent(t *testing.T) {
+	projectRoot := t.TempDir()
+	sourceDir := filepath.Join(projectRoot, "source")
+	if err := os.MkdirAll(sourceDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	want := []byte("# Rules\n\x00byte-identical\n")
+	if err := os.WriteFile(filepath.Join(sourceDir, "rules.md"), want, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	registry := source.NewRegistry()
+	registry.Register("local", &source.LocalResolver{})
+	contentCache, err := cache.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{
+		Version: 1,
+		Sources: []config.Source{{Name: "rules", Type: "local", Path: "source"}},
+		Targets: []config.Target{{Source: "rules", Destination: ".out"}},
+	}
+
+	updated, err := (&UpdateEngine{Registry: registry, Cache: contentCache, ProjectRoot: projectRoot}).Update(
+		context.Background(), cfg, nil, UpdateOptions{},
+	)
+	if err != nil || len(updated.Failed) != 0 || updated.Lockfile == nil {
+		t.Fatalf("Update() = %+v, %v", updated, err)
+	}
+	fileHash := updated.Lockfile.Sources[0].Resolved.Files["rules.md"].SHA256
+	cached, found, err := contentCache.Get(fileHash)
+	if err != nil || !found || !bytes.Equal(cached, want) {
+		t.Fatalf("cached content = %q, found=%v, err=%v; want %q", cached, found, err, want)
+	}
+
+	synced, err := (&SyncEngine{
+		Registry: registry, Cache: contentCache, ToolMap: target.NewToolMap(nil), ProjectRoot: projectRoot,
+	}).Sync(context.Background(), *updated.Lockfile, cfg, SyncOptions{})
+	if err != nil || len(synced.Errors) != 0 {
+		t.Fatalf("Sync() = %+v, %v", synced, err)
+	}
+	got, err := os.ReadFile(filepath.Join(projectRoot, ".out", "rules.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("synced content = %q, want byte-identical %q", got, want)
+	}
+}
+
+func TestLocalSourceUpdateRejectsNestedSymlinkEscape(t *testing.T) {
+	projectRoot := t.TempDir()
+	sourceDir := filepath.Join(projectRoot, "source")
+	if err := os.MkdirAll(sourceDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	outsideFile := filepath.Join(t.TempDir(), "secret.md")
+	if err := os.WriteFile(outsideFile, []byte("outside"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsideFile, filepath.Join(sourceDir, "linked.md")); err != nil {
+		t.Fatal(err)
+	}
+	registry := source.NewRegistry()
+	registry.Register("local", &source.LocalResolver{})
+	contentCache, err := cache.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{Version: 1, Sources: []config.Source{{Name: "escape", Type: "local", Path: "source"}}}
+
+	result, err := (&UpdateEngine{Registry: registry, Cache: contentCache, ProjectRoot: projectRoot}).Update(
+		context.Background(), cfg, nil, UpdateOptions{},
+	)
+	if err != nil {
+		t.Fatalf("Update() error = %v", err)
+	}
+	if len(result.Failed) != 1 || len(result.Updated) != 0 || len(result.Lockfile.Sources) != 0 {
+		t.Fatalf("Update() result = %+v, want one failure and no updated/locked source", result)
+	}
+}
 
 func TestUpdateEngineUnknownSourceName(t *testing.T) {
 	reg := newTestRegistry(map[string]*mockResolver{})

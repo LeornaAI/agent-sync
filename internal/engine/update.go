@@ -74,6 +74,8 @@ func (e *UpdateEngine) Update(ctx context.Context, cfg config.Config, currentLoc
 
 	// Resolve each source.
 	newByName := make(map[string]lock.LockedSource)
+
+sourceLoop:
 	for _, src := range sourcesToUpdate {
 		resolver, err := e.Registry.Get(src.Type)
 		if err != nil {
@@ -90,7 +92,22 @@ func (e *UpdateEngine) Update(ctx context.Context, cfg config.Config, currentLoc
 		// Convert to lockfile entry.
 		ls := resolvedToLocked(src, resolved)
 
-		// Record update.
+		// Cache fetched content.
+		if e.Cache != nil {
+			fetched, fetchErr := fetchResolvedSource(ctx, resolver, resolved, e.ProjectRoot)
+			if fetchErr != nil {
+				result.Failed = append(result.Failed, SourceError{Source: src.Name, Err: fetchErr})
+				continue
+			}
+			for _, f := range fetched {
+				if cacheErr := e.Cache.Put(f.SHA256, f.Content); cacheErr != nil {
+					result.Failed = append(result.Failed, SourceError{Source: src.Name, Err: cacheErr})
+					continue sourceLoop
+				}
+			}
+		}
+
+		// Record only sources whose content was fetched and cached successfully.
 		var before *lock.LockedSource
 		if prev, ok := currentByName[src.Name]; ok {
 			before = &prev
@@ -100,18 +117,7 @@ func (e *UpdateEngine) Update(ctx context.Context, cfg config.Config, currentLoc
 			Before: before,
 			After:  &ls,
 		})
-
 		newByName[src.Name] = ls
-
-		// Cache fetched content.
-		if e.Cache != nil {
-			fetched, fetchErr := resolver.Fetch(ctx, resolved)
-			if fetchErr == nil {
-				for _, f := range fetched {
-					_ = e.Cache.Put(f.SHA256, f.Content)
-				}
-			}
-		}
 	}
 
 	if opts.DryRun {
@@ -137,6 +143,22 @@ func (e *UpdateEngine) Update(ctx context.Context, cfg config.Config, currentLoc
 
 	result.Lockfile = newLock
 	return result, nil
+}
+
+type projectRootFetcher interface {
+	FetchWithRoot(context.Context, *source.ResolvedSource, string) ([]source.FetchedFile, error)
+}
+
+func fetchResolvedSource(
+	ctx context.Context,
+	resolver source.Resolver,
+	resolved *source.ResolvedSource,
+	projectRoot string,
+) ([]source.FetchedFile, error) {
+	if local, ok := resolver.(projectRootFetcher); ok {
+		return local.FetchWithRoot(ctx, resolved, projectRoot)
+	}
+	return resolver.Fetch(ctx, resolved)
 }
 
 func resolvedToLocked(src config.Source, resolved *source.ResolvedSource) lock.LockedSource {
