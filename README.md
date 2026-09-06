@@ -69,6 +69,14 @@ targets:
 - [Go Library](https://bianoble.github.io/agent-sync/reference/library/) — Use agent-sync as a Go library
 - [Enterprise & DevSecOps](https://bianoble.github.io/agent-sync/guides/enterprise-config/) — Hierarchical config, compliance, and deployment at scale
 
+## Local-source security boundary
+
+Local source and project trees must be trusted and must not be modified while
+`agent-sync update` or `agent-sync sync` is running. Do not run agent-sync with
+elevated privileges against attacker-writable trees: path and symlink checks are
+performed before file reads, but those separate filesystem operations are not
+descriptor-atomic.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, code style, and PR guidelines.
