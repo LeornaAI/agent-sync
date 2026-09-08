@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/bianoble/agent-sync/internal/config"
+	"github.com/bianoble/agent-sync/internal/sandbox"
 )
 
 // GitResolver resolves and fetches files from git repositories.
@@ -35,6 +36,10 @@ func (g *GitResolver) Resolve(ctx context.Context, src config.Source, projectRoo
 	if cloneErr := gitClone(ctx, src.Repo, src.Ref, tmpDir); cloneErr != nil {
 		return nil, &SourceError{Source: src.Name, Operation: "resolve", Err: cloneErr, Hint: "check repo URL, ref, and authentication"}
 	}
+	repoRoot, err := sandbox.ValidatePath(tmpDir, ".")
+	if err != nil {
+		return nil, &SourceError{Source: src.Name, Operation: "resolve", Err: fmt.Errorf("resolving cloned repository root: %w", err)}
+	}
 
 	// Resolve commit SHA.
 	commit, err := gitRevParse(ctx, tmpDir, "HEAD")
@@ -51,7 +56,10 @@ func (g *GitResolver) Resolve(ctx context.Context, src config.Source, projectRoo
 	// Walk files and compute hashes.
 	files := make(map[string]string)
 	for _, pathFilter := range effectivePaths(src.Paths) {
-		walkRoot := filepath.Join(tmpDir, pathFilter)
+		walkRoot, pathErr := sandbox.ValidatePath(repoRoot, pathFilter)
+		if pathErr != nil {
+			return nil, &SourceError{Source: src.Name, Operation: "resolve", Err: fmt.Errorf("path %q escapes cloned repository: %w", pathFilter, pathErr)}
+		}
 		info, statErr := os.Stat(walkRoot)
 		if statErr != nil {
 			continue // path doesn't exist in repo
@@ -59,7 +67,7 @@ func (g *GitResolver) Resolve(ctx context.Context, src config.Source, projectRoo
 
 		if !info.IsDir() {
 			// Single file.
-			hash, hashErr := hashFile(walkRoot)
+			hash, hashErr := hashFileWithin(repoRoot, pathFilter)
 			if hashErr != nil {
 				return nil, &SourceError{Source: src.Name, Operation: "resolve", Err: hashErr}
 			}
@@ -80,11 +88,11 @@ func (g *GitResolver) Resolve(ctx context.Context, src config.Source, projectRoo
 			if strings.HasPrefix(fi.Name(), ".") {
 				return nil
 			}
-			rel, relErr := filepath.Rel(tmpDir, path)
+			rel, relErr := filepath.Rel(repoRoot, path)
 			if relErr != nil {
 				return relErr
 			}
-			hash, hashErr := hashFile(path)
+			hash, hashErr := hashFileWithin(repoRoot, rel)
 			if hashErr != nil {
 				return hashErr
 			}
@@ -121,10 +129,17 @@ func (g *GitResolver) Fetch(ctx context.Context, resolved *ResolvedSource) ([]Fe
 	if cloneErr := gitCloneAtCommit(ctx, resolved.Repo, resolved.Commit, tmpDir); cloneErr != nil {
 		return nil, &SourceError{Source: resolved.Name, Operation: "fetch", Err: cloneErr, Hint: "check repo access and commit SHA"}
 	}
+	repoRoot, err := sandbox.ValidatePath(tmpDir, ".")
+	if err != nil {
+		return nil, &SourceError{Source: resolved.Name, Operation: "fetch", Err: fmt.Errorf("resolving cloned repository root: %w", err)}
+	}
 
 	var fetched []FetchedFile
 	for relPath, expectedHash := range resolved.Files {
-		absPath := filepath.Join(tmpDir, relPath)
+		absPath, pathErr := sandbox.ValidatePath(repoRoot, relPath)
+		if pathErr != nil {
+			return nil, &SourceError{Source: resolved.Name, Operation: "fetch", Err: fmt.Errorf("path %q escapes cloned repository: %w", relPath, pathErr)}
+		}
 		content, readErr := os.ReadFile(absPath)
 		if readErr != nil {
 			return nil, &SourceError{Source: resolved.Name, Operation: "fetch", Err: fmt.Errorf("reading %s: %w", relPath, readErr)}
@@ -197,7 +212,11 @@ func gitRevParse(ctx context.Context, repoDir, rev string) (string, error) {
 	return strings.TrimSpace(string(output)), nil
 }
 
-func hashFile(path string) (string, error) {
+func hashFileWithin(root, relPath string) (string, error) {
+	path, err := sandbox.ValidatePath(root, relPath)
+	if err != nil {
+		return "", fmt.Errorf("path %q escapes cloned repository: %w", relPath, err)
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return "", err

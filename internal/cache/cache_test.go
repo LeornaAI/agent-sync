@@ -39,12 +39,44 @@ func TestGetMiss(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, found, err := c.Get("nonexistent_hash")
+	_, found, err := c.Get(ComputeHash([]byte("not cached")))
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
 	if found {
 		t.Fatal("expected cache miss")
+	}
+}
+
+func TestRejectsHashPathTraversalBeforeFilesystemAccess(t *testing.T) {
+	root := t.TempDir()
+	c, err := New(filepath.Join(root, "cache"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	victim := filepath.Join(root, "victim")
+	if err := os.WriteFile(victim, []byte("keep me"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	malicious := "../../victim"
+
+	if _, _, err := c.Get(malicious); err == nil {
+		t.Fatal("Get() accepted a non-SHA-256 cache key")
+	}
+	if c.Has(malicious) {
+		t.Fatal("Has() accepted a non-SHA-256 cache key")
+	}
+	if err := c.Put(malicious, []byte("replacement")); err == nil {
+		t.Fatal("Put() accepted a non-SHA-256 cache key")
+	}
+
+	content, err := os.ReadFile(victim)
+	if err != nil {
+		t.Fatalf("victim was removed: %v", err)
+	}
+	if string(content) != "keep me" {
+		t.Fatalf("victim content = %q, want unchanged", content)
 	}
 }
 

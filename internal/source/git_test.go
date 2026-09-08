@@ -151,3 +151,85 @@ func TestGitResolverNoPathFilter(t *testing.T) {
 		t.Errorf("expected 2 files, got %d: %v", len(resolved.Files), resolved.Files)
 	}
 }
+
+func TestGitResolverRejectsSymlinkEscapingClone(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	outsideDir := t.TempDir()
+	outsidePath := filepath.Join(outsideDir, "secret.md")
+	if err := os.WriteFile(outsidePath, []byte("local secret"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	workDir := t.TempDir()
+	bareRepo := t.TempDir()
+	runGit := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@test.com", "GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@test.com")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %s: %v", args, output, err)
+		}
+	}
+
+	runGit(workDir, "init", "-b", "main")
+	if err := os.Symlink(outsidePath, filepath.Join(workDir, "escape.md")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	runGit(workDir, "add", "escape.md")
+	runGit(workDir, "commit", "-m", "add escaping symlink")
+	runGit(workDir, "clone", "--bare", workDir, bareRepo)
+
+	_, err := (&GitResolver{}).Resolve(context.Background(), config.Source{
+		Name: "malicious", Type: "git", Repo: bareRepo, Ref: "main",
+	}, t.TempDir())
+	if err == nil {
+		t.Fatal("Resolve() followed a symlink outside the cloned repository")
+	}
+	if !strings.Contains(err.Error(), "outside") {
+		t.Fatalf("Resolve() error = %v, want containment error", err)
+	}
+}
+
+func TestGitResolverFetchRejectsLockfilePathTraversal(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	workDir := t.TempDir()
+	bareRepo := t.TempDir()
+	runGit := func(dir string, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@test.com", "GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@test.com")
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %s: %v", args, output, err)
+		}
+		return strings.TrimSpace(string(output))
+	}
+
+	runGit(workDir, "init", "-b", "main")
+	if err := os.WriteFile(filepath.Join(workDir, "safe.md"), []byte("safe"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(workDir, "add", "safe.md")
+	runGit(workDir, "commit", "-m", "initial")
+	commit := runGit(workDir, "rev-parse", "HEAD")
+	runGit(workDir, "clone", "--bare", workDir, bareRepo)
+
+	_, err := (&GitResolver{}).Fetch(context.Background(), &ResolvedSource{
+		Name: "malicious", Type: "git", Repo: bareRepo, Commit: commit,
+		Files: map[string]string{"../../victim": computeSHA256([]byte("anything"))},
+	})
+	if err == nil {
+		t.Fatal("Fetch() accepted a traversing lockfile path")
+	}
+	if !strings.Contains(err.Error(), "outside") {
+		t.Fatalf("Fetch() error = %v, want containment error", err)
+	}
+}

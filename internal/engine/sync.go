@@ -31,6 +31,12 @@ type SyncOptions struct {
 	DryRun bool
 }
 
+type fileOp struct {
+	destPath string
+	source   string
+	content  []byte
+}
+
 // Sync synchronizes files to targets using the lockfile as the source of truth.
 // It does NOT modify the lockfile.
 func (e *SyncEngine) Sync(ctx context.Context, lf lock.Lockfile, cfg config.Config, opts SyncOptions) (*SyncResult, error) {
@@ -42,81 +48,14 @@ func (e *SyncEngine) Sync(ctx context.Context, lf lock.Lockfile, cfg config.Conf
 		return nil, fmt.Errorf("resolving targets: %w", err)
 	}
 
-	// Build a lookup of locked sources by name.
-	lockedByName := make(map[string]lock.LockedSource)
-	for _, ls := range lf.Sources {
-		lockedByName[ls.Name] = ls
-	}
-
-	// Build transform lookup.
-	transformsBySource := make(map[string][]config.Transform)
-	for _, tx := range cfg.Transforms {
-		transformsBySource[tx.Source] = append(transformsBySource[tx.Source], tx)
-	}
-
 	// Snapshot existing target files for rollback.
 	var snapshots []snapshot
 	var writtenPaths []string
 
-	// Collect all file operations to perform.
-	type fileOp struct {
-		destPath string // relative to project root
-		source   string
-		content  []byte
-	}
-	var ops []fileOp
-
-	// Process each locked source.
-	for _, ls := range lf.Sources {
-		targets, ok := targetMap[ls.Name]
-		if !ok {
-			continue // source has no targets (warning handled elsewhere)
-		}
-
-		// Fetch content for this source.
-		files, fetchErr := e.fetchSourceFiles(ctx, ls, cfg)
-		if fetchErr != nil {
-			result.Errors = append(result.Errors, SourceError{Source: ls.Name, Err: fetchErr})
-			continue
-		}
-
-		// Apply template transforms.
-		if transforms, hasTx := transformsBySource[ls.Name]; hasTx {
-			files, fetchErr = applyTransforms(files, transforms, cfg.Variables)
-			if fetchErr != nil {
-				result.Errors = append(result.Errors, SourceError{Source: ls.Name, Err: fetchErr})
-				continue
-			}
-		}
-
-		// Map files to target destinations.
-		for _, tgt := range targets {
-			for relPath, content := range files {
-				destPath := filepath.Join(tgt.Destination, relPath)
-				ops = append(ops, fileOp{destPath: destPath, content: content, source: ls.Name})
-			}
-		}
-	}
-
-	// Apply overrides.
-	if len(cfg.Overrides) > 0 {
-		overrideProc := &transform.OverrideProcessor{ProjectRoot: e.ProjectRoot}
-		// Build file map by destination filename for override matching.
-		filesByName := make(map[string][]byte)
-		for _, op := range ops {
-			filesByName[filepath.Base(op.destPath)] = op.content
-		}
-		applied, overrideErr := overrideProc.Apply(filesByName, cfg.Overrides)
-		if overrideErr != nil {
-			return nil, fmt.Errorf("applying overrides: %w", overrideErr)
-		}
-		// Update ops with overridden content.
-		for i, op := range ops {
-			baseName := filepath.Base(op.destPath)
-			if newContent, ok := applied[baseName]; ok {
-				ops[i].content = newContent
-			}
-		}
+	ops, sourceErrors, err := e.prepareOperations(ctx, lf, cfg, targetMap)
+	result.Errors = append(result.Errors, sourceErrors...)
+	if err != nil {
+		return nil, err
 	}
 
 	// Sort ops for deterministic output.
@@ -126,7 +65,11 @@ func (e *SyncEngine) Sync(ctx context.Context, lf lock.Lockfile, cfg config.Conf
 
 	if opts.DryRun {
 		for _, op := range ops {
-			absPath := filepath.Join(e.ProjectRoot, op.destPath)
+			absPath, pathErr := sandbox.ValidatePath(e.ProjectRoot, op.destPath)
+			if pathErr != nil {
+				result.Errors = append(result.Errors, SourceError{Source: op.source, Err: fmt.Errorf("checking %s: %w", op.destPath, pathErr)})
+				continue
+			}
 			existing, err := os.ReadFile(absPath)
 			if err != nil {
 				result.Written = append(result.Written, FileAction{Path: op.destPath, Action: "new"})
@@ -141,7 +84,11 @@ func (e *SyncEngine) Sync(ctx context.Context, lf lock.Lockfile, cfg config.Conf
 
 	// Snapshot existing files for rollback.
 	for _, op := range ops {
-		absPath := filepath.Join(e.ProjectRoot, op.destPath)
+		absPath, pathErr := sandbox.ValidatePath(e.ProjectRoot, op.destPath)
+		if pathErr != nil {
+			result.Errors = append(result.Errors, SourceError{Source: op.source, Err: fmt.Errorf("snapshotting %s: %w", op.destPath, pathErr)})
+			continue
+		}
 		existing, err := os.ReadFile(absPath)
 		if err == nil {
 			snapshots = append(snapshots, snapshot{path: op.destPath, content: existing, existed: true})
@@ -152,7 +99,12 @@ func (e *SyncEngine) Sync(ctx context.Context, lf lock.Lockfile, cfg config.Conf
 
 	// Write files.
 	for _, op := range ops {
-		absPath := filepath.Join(e.ProjectRoot, op.destPath)
+		absPath, pathErr := sandbox.ValidatePath(e.ProjectRoot, op.destPath)
+		if pathErr != nil {
+			rollback(e.ProjectRoot, writtenPaths, snapshots)
+			result.Errors = append(result.Errors, SourceError{Source: op.source, Err: fmt.Errorf("writing %s: %w", op.destPath, pathErr)})
+			return result, fmt.Errorf("sync failed, rolled back: %w", pathErr)
+		}
 		existing, readErr := os.ReadFile(absPath)
 		if readErr == nil && hex.EncodeToString(sha256Hash(existing)) == hex.EncodeToString(sha256Hash(op.content)) {
 			result.Skipped = append(result.Skipped, FileAction{Path: op.destPath, Action: "unchanged"})
@@ -177,6 +129,65 @@ func (e *SyncEngine) Sync(ctx context.Context, lf lock.Lockfile, cfg config.Conf
 	return result, nil
 }
 
+func (e *SyncEngine) prepareOperations(ctx context.Context, lf lock.Lockfile, cfg config.Config, targetMap map[string][]target.ResolvedTarget) ([]fileOp, []SourceError, error) {
+	transformsBySource := make(map[string][]config.Transform)
+	for _, tx := range cfg.Transforms {
+		transformsBySource[tx.Source] = append(transformsBySource[tx.Source], tx)
+	}
+
+	var ops []fileOp
+	var sourceErrors []SourceError
+	for _, ls := range lf.Sources {
+		targets, ok := targetMap[ls.Name]
+		if !ok {
+			continue
+		}
+
+		files, err := e.fetchSourceFiles(ctx, ls, cfg)
+		if err != nil {
+			sourceErrors = append(sourceErrors, SourceError{Source: ls.Name, Err: err})
+			continue
+		}
+
+		if transforms, ok := transformsBySource[ls.Name]; ok {
+			files, err = applyTransforms(files, transforms, cfg.Variables)
+			if err != nil {
+				sourceErrors = append(sourceErrors, SourceError{Source: ls.Name, Err: err})
+				continue
+			}
+		}
+
+		for _, tgt := range targets {
+			for relPath, content := range files {
+				ops = append(ops, fileOp{
+					destPath: filepath.Join(tgt.Destination, relPath),
+					source:   ls.Name,
+					content:  content,
+				})
+			}
+		}
+	}
+
+	if len(cfg.Overrides) > 0 {
+		overrideProc := &transform.OverrideProcessor{ProjectRoot: e.ProjectRoot}
+		filesByName := make(map[string][]byte)
+		for _, op := range ops {
+			filesByName[filepath.Base(op.destPath)] = op.content
+		}
+		applied, err := overrideProc.Apply(filesByName, cfg.Overrides)
+		if err != nil {
+			return nil, sourceErrors, fmt.Errorf("applying overrides: %w", err)
+		}
+		for i, op := range ops {
+			if content, ok := applied[filepath.Base(op.destPath)]; ok {
+				ops[i].content = content
+			}
+		}
+	}
+
+	return ops, sourceErrors, nil
+}
+
 func (e *SyncEngine) fetchSourceFiles(ctx context.Context, ls lock.LockedSource, cfg config.Config) (map[string][]byte, error) {
 	files := make(map[string][]byte)
 
@@ -184,13 +195,19 @@ func (e *SyncEngine) fetchSourceFiles(ctx context.Context, ls lock.LockedSource,
 		// Try cache first.
 		if e.Cache != nil {
 			content, found, err := e.Cache.Get(fh.SHA256)
-			if err == nil && found {
+			if err != nil {
+				return nil, fmt.Errorf("reading %s from cache: %w", relPath, err)
+			}
+			if found {
 				files[relPath] = content
 				continue
 			}
 		}
 
 		// Fetch from source.
+		if e.Registry == nil {
+			return nil, fmt.Errorf("source registry is required to fetch uncached source %q", ls.Name)
+		}
 		resolver, err := e.Registry.Get(ls.Type)
 		if err != nil {
 			return nil, err
@@ -219,7 +236,9 @@ func (e *SyncEngine) fetchSourceFiles(ctx context.Context, ls lock.LockedSource,
 		for _, f := range fetched {
 			files[f.RelPath] = f.Content
 			if e.Cache != nil {
-				_ = e.Cache.Put(f.SHA256, f.Content)
+				if err := e.Cache.Put(f.SHA256, f.Content); err != nil {
+					return nil, fmt.Errorf("caching %s: %w", f.RelPath, err)
+				}
 			}
 		}
 		break // All files fetched in one call
@@ -229,10 +248,16 @@ func (e *SyncEngine) fetchSourceFiles(ctx context.Context, ls lock.LockedSource,
 	for relPath, fh := range ls.Resolved.Files {
 		if _, ok := files[relPath]; !ok {
 			if e.Cache != nil {
-				content, found, _ := e.Cache.Get(fh.SHA256)
+				content, found, err := e.Cache.Get(fh.SHA256)
+				if err != nil {
+					return nil, fmt.Errorf("reading %s from cache: %w", relPath, err)
+				}
 				if found {
 					files[relPath] = content
 				}
+			}
+			if _, found := files[relPath]; !found {
+				return nil, fmt.Errorf("locked file %q was not returned by source %q", relPath, ls.Name)
 			}
 		}
 	}
