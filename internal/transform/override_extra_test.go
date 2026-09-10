@@ -138,6 +138,43 @@ func TestApplyMissingOverrideFile(t *testing.T) {
 	}
 }
 
+func TestOverrideRejectsPathOutsideProject(t *testing.T) {
+	projectRoot := t.TempDir()
+	outsideRoot := t.TempDir()
+	outsidePath := filepath.Join(outsideRoot, "secret.md")
+	if err := os.WriteFile(outsidePath, []byte("secret"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	p := &OverrideProcessor{ProjectRoot: projectRoot}
+	_, err := p.ApplySingle([]byte("base"), config.Override{
+		Target: "file.md", Strategy: "replace", File: outsidePath,
+	})
+	if err == nil {
+		t.Fatal("ApplySingle() read an override outside the project root")
+	}
+}
+
+func TestOverrideRejectsEscapingSymlink(t *testing.T) {
+	projectRoot := t.TempDir()
+	outsideRoot := t.TempDir()
+	outsidePath := filepath.Join(outsideRoot, "secret.md")
+	if err := os.WriteFile(outsidePath, []byte("secret"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsidePath, filepath.Join(projectRoot, "override.md")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	p := &OverrideProcessor{ProjectRoot: projectRoot}
+	_, err := p.ApplySingle([]byte("base"), config.Override{
+		Target: "file.md", Strategy: "replace", File: "override.md",
+	})
+	if err == nil {
+		t.Fatal("ApplySingle() followed an override symlink outside the project root")
+	}
+}
+
 func TestDetectConflictsThreeSources(t *testing.T) {
 	dests := map[string][]string{
 		".cursor/rules/security.md": {"source-a", "source-b", "source-c"},

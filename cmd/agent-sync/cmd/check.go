@@ -29,7 +29,14 @@ Exit 0 if everything matches; exit non-zero on drift. Suitable for CI pipelines.
 			return err
 		}
 
+		contentCache, err := newCache()
+		if err != nil {
+			return err
+		}
+
 		eng := &engine.CheckEngine{
+			Registry:    newRegistry(),
+			Cache:       contentCache,
 			ToolMap:     newToolMap(cfg),
 			ProjectRoot: root,
 		}
@@ -52,8 +59,11 @@ Exit 0 if everything matches; exit non-zero on drift. Suitable for CI pipelines.
 		for _, m := range result.Missing {
 			info("  missing   %s", m)
 		}
+		for _, checkErr := range result.Errors {
+			info("  error     %s", checkErr)
+		}
 
-		total := len(result.Drifted) + len(result.Missing)
+		total := len(result.Drifted) + len(result.Missing) + len(result.Errors)
 		return fmt.Errorf("check failed: %d file(s) out of sync", total)
 	},
 }

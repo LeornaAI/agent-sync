@@ -246,6 +246,8 @@ func (c *Client) Check(ctx context.Context) (*CheckResult, error) {
 	}
 
 	eng := &engine.CheckEngine{
+		Registry:    c.registry,
+		Cache:       c.cache,
 		ToolMap:     c.toolMap(cfg),
 		ProjectRoot: c.projectRoot,
 	}

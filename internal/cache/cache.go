@@ -47,6 +47,9 @@ func DefaultDir() string {
 // Returns nil, false if not cached.
 // Returns error if cached but hash verification fails (corruption).
 func (c *Cache) Get(hash string) ([]byte, bool, error) {
+	if err := validateSHA256(hash); err != nil {
+		return nil, false, fmt.Errorf("invalid cache hash: %w", err)
+	}
 	path := c.objectPath(hash)
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -71,6 +74,9 @@ func (c *Cache) Get(hash string) ([]byte, bool, error) {
 // Verifies the content matches the hash before storing.
 // No-op if already cached.
 func (c *Cache) Put(hash string, content []byte) error {
+	if err := validateSHA256(hash); err != nil {
+		return fmt.Errorf("invalid cache hash: %w", err)
+	}
 	// Verify content matches the declared hash.
 	actual := computeHash(content)
 	if actual != hash {
@@ -125,6 +131,9 @@ func (c *Cache) Put(hash string, content []byte) error {
 
 // Has checks if a hash exists in the cache without reading content.
 func (c *Cache) Has(hash string) bool {
+	if validateSHA256(hash) != nil {
+		return false
+	}
 	_, err := os.Stat(c.objectPath(hash))
 	return err == nil
 }
@@ -164,4 +173,15 @@ func ComputeHash(content []byte) string {
 func computeHash(content []byte) string {
 	h := sha256.Sum256(content)
 	return hex.EncodeToString(h[:])
+}
+
+func validateSHA256(hash string) error {
+	if len(hash) != sha256.Size*2 {
+		return fmt.Errorf("SHA-256 must contain exactly %d lowercase hexadecimal characters", sha256.Size*2)
+	}
+	decoded, err := hex.DecodeString(hash)
+	if err != nil || hex.EncodeToString(decoded) != hash {
+		return errors.New("SHA-256 must contain only lowercase hexadecimal characters")
+	}
+	return nil
 }

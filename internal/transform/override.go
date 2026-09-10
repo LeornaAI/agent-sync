@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 
 	"github.com/bianoble/agent-sync/internal/config"
+	"github.com/bianoble/agent-sync/internal/sandbox"
 )
 
 // OverrideProcessor applies overrides to synced files.
@@ -18,7 +19,10 @@ type OverrideProcessor struct {
 // Per spec Section 6.2 rule 5.
 func (o *OverrideProcessor) ValidateOverrides(overrides []config.Override) error {
 	for _, ov := range overrides {
-		absPath := filepath.Join(o.ProjectRoot, ov.File)
+		absPath, pathErr := sandbox.ValidatePath(o.ProjectRoot, ov.File)
+		if pathErr != nil {
+			return fmt.Errorf("override for '%s': file '%s' escapes the project root: %w", ov.Target, ov.File, pathErr)
+		}
 		if _, err := os.Stat(absPath); errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("override for '%s': file '%s' does not exist — create it or remove the override", ov.Target, ov.File)
 		} else if err != nil {
@@ -45,7 +49,7 @@ func (o *OverrideProcessor) Apply(syncedFiles map[string][]byte, overrides []con
 			return nil, fmt.Errorf("override for '%s': target file does not exist after sync — check that the source produces this file", ov.Target)
 		}
 
-		overrideContent, err := os.ReadFile(filepath.Join(o.ProjectRoot, ov.File))
+		overrideContent, err := o.readOverride(ov.File)
 		if err != nil {
 			return nil, fmt.Errorf("override for '%s': reading override file '%s': %w", ov.Target, ov.File, err)
 		}
@@ -70,7 +74,7 @@ func (o *OverrideProcessor) Apply(syncedFiles map[string][]byte, overrides []con
 
 // ApplySingle applies a single override to file content.
 func (o *OverrideProcessor) ApplySingle(content []byte, ov config.Override) ([]byte, error) {
-	overrideContent, err := os.ReadFile(filepath.Join(o.ProjectRoot, ov.File))
+	overrideContent, err := o.readOverride(ov.File)
 	if err != nil {
 		return nil, fmt.Errorf("reading override file '%s': %w", ov.File, err)
 	}
@@ -85,6 +89,14 @@ func (o *OverrideProcessor) ApplySingle(content []byte, ov config.Override) ([]b
 	default:
 		return nil, fmt.Errorf("invalid strategy '%s'", ov.Strategy)
 	}
+}
+
+func (o *OverrideProcessor) readOverride(path string) ([]byte, error) {
+	resolved, err := sandbox.ValidatePath(o.ProjectRoot, path)
+	if err != nil {
+		return nil, fmt.Errorf("path escapes the project root: %w", err)
+	}
+	return os.ReadFile(resolved)
 }
 
 func appendContent(original, addition []byte) []byte {
