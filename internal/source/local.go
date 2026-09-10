@@ -150,8 +150,8 @@ func (l *LocalResolver) FetchWithRoot(ctx context.Context, resolved *ResolvedSou
 	var fetched []FetchedFile
 	for _, relPath := range relPaths {
 		expectedHash := resolved.Files[relPath]
-		if err := ctx.Err(); err != nil {
-			return nil, &SourceError{Source: resolved.Name, Operation: "fetch", Err: err}
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, &SourceError{Source: resolved.Name, Operation: "fetch", Err: contextErr}
 		}
 		var absPath string
 		if info.IsDir() {

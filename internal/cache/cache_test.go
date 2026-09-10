@@ -56,18 +56,18 @@ func TestRejectsHashPathTraversalBeforeFilesystemAccess(t *testing.T) {
 	}
 
 	victim := filepath.Join(root, "victim")
-	if err := os.WriteFile(victim, []byte("keep me"), 0644); err != nil {
-		t.Fatal(err)
+	if writeErr := os.WriteFile(victim, []byte("keep me"), 0644); writeErr != nil {
+		t.Fatal(writeErr)
 	}
 	malicious := "../../victim"
 
-	if _, _, err := c.Get(malicious); err == nil {
+	if _, _, getErr := c.Get(malicious); getErr == nil {
 		t.Fatal("Get() accepted a non-SHA-256 cache key")
 	}
 	if c.Has(malicious) {
 		t.Fatal("Has() accepted a non-SHA-256 cache key")
 	}
-	if err := c.Put(malicious, []byte("replacement")); err == nil {
+	if putErr := c.Put(malicious, []byte("replacement")); putErr == nil {
 		t.Fatal("Put() accepted a non-SHA-256 cache key")
 	}
 
